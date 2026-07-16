@@ -1,0 +1,7 @@
+include README.md
+include LICENSE
+include PUBLISHING.md
+recursive-include src/notebook_terminal/static *
+recursive-include tests *.py
+
+include CHANGELOG.md
