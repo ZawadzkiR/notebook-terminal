@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "notebook-terminal"
+version = "0.5.1"
+description = "A cross-platform PTY/ConPTY terminal for Jupyter with bundled xterm.js"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Robert Zawadzki"}]
+dependencies = [
+  "ipywidgets>=8.1",
+  "ipython>=8",
+  "traitlets>=5",
+  "jupyterlab_widgets>=3.0,<4",
+  "widgetsnbextension>=4.0,<5",
+  "pywinpty>=3.0.0; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+flask = ["Flask>=2.3", "flask-sock>=0.7"]
+django = ["Django>=4.2", "channels>=4"]
+plotly = ["plotly>=5"]
+data = ["pandas>=1.5", "matplotlib>=3.6"]
+dev = ["build>=1.2", "twine>=5", "pytest>=8"]
+
+[tool.setuptools]
+packages = ["notebook_terminal"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+notebook_terminal = ["static/*.js", "static/*.css"]
