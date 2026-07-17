@@ -1,28 +1,11 @@
 # Changelog
 
-## 0.1.1
+## 0\.2.0
 
-- Fixed ANSI status messages being interpreted as PowerShell input.
-- Added programmatic command history and rerun helpers.
-- Added run_many, send_key, wait_until_idle, and restart helpers.
+* Removed the `anywidget` dependency and all custom widget model registration.
+* Restored the full bundled xterm.js frontend through standard `ipywidgets` bridge channels.
+* Added fully offline notebook operation with no CDN, local server, iframe, or extra port.
+* Preserved PTY/ConPTY prompt output from the actual user shell; no prompt or user path is hardcoded.
+* Kept kernel-loop dispatching for compatibility with ipykernel 6 and 7.
+* Preserved Flask and Django terminal session integrations.
 
-
-## 0.1.1
-
-Initial public alpha release.
-
-### Included
-
-- PTY/ConPTY terminal sessions
-- Jupyter terminal widget
-- interactive and read-only modes
-- real-time output streaming
-- Python command and file execution
-- DataFrame, Matplotlib, Seaborn, Plotly, and Jupyter widget tabs
-- closable rich-output tabs
-- Flask and Django adapters
-- ANSI status helpers
-
-### Fixed before release
-
-- Styled messages now use the terminal output channel rather than shell stdin. This prevents PowerShell from interpreting ANSI reset fragments such as `[0m` as commands.

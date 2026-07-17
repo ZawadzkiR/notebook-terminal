@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "notebook-terminal"
-version = "0.1.1"
+version = "0.2.0"
 description = "A cross-platform embeddable PTY/ConPTY terminal for Jupyter and Python web applications"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -32,12 +32,11 @@ classifiers = [
   "Topic :: Software Development :: User Interfaces"
 ]
 dependencies = [
-  "anywidget>=0.9.13",
   "ipywidgets>=8.1",
   "ipython>=8",
   "traitlets>=5",
-  "jupyterlab_widgets>=3.0",
-  "widgetsnbextension>=4.0",
+  "jupyterlab_widgets>=3.0,<4",
+  "widgetsnbextension>=4.0,<5",
   "pywinpty>=3.0.0; platform_system == 'Windows'"
 ]
 

@@ -10,7 +10,7 @@ except ImportError:
 
     def terminal(*args, **kwargs):
         raise RuntimeError(
-            "Jupyter UI requires anywidget, ipython and traitlets. "
+            "Jupyter UI requires ipywidgets, IPython and traitlets. "
             "Install the normal package dependencies."
         )
 
@@ -23,4 +23,4 @@ __all__ = [
     "TerminalManager",
     "terminal",
 ]
-__version__ = "0.1.1"
+__version__ = "0.4.0"
