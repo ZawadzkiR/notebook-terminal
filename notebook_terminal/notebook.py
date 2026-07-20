@@ -18,6 +18,7 @@ import ipywidgets as widgets
 from IPython.display import Javascript, display
 
 from .session import TerminalSession
+from .remote import RemoteTerminalSession
 from .styling import Color, ansi_text
 
 _STATIC = Path(__file__).with_name("static")
@@ -386,6 +387,7 @@ class TerminalWidget(widgets.VBox):
     }};
     window.__nbterm_render({{model, el: root}});
     let previousOutput = '';
+    let lastOutputSeq = 0;
     let previousControl = '';
     let lastActionSeq = 0;
     const poll = () => {{
@@ -394,7 +396,22 @@ class TerminalWidget(widgets.VBox):
         previousOutput = output.value;
         try {{
           const message = JSON.parse(output.value);
-          (listeners['msg:custom'] || []).forEach(fn => fn(message));
+          if (message && message.type === 'output_batch') {{
+            let highest = 0;
+            for (const item of (message.items || [])) {{
+              const seq = Number(item.seq || 0);
+              if (seq <= lastOutputSeq) continue;
+              lastOutputSeq = seq;
+              highest = Math.max(highest, seq);
+              (listeners['msg:custom'] || []).forEach(fn => fn({{type:'output', data:item.data}}));
+            }}
+            if (highest > 0) {{
+              pendingInput.push({{seq: nextInputSeq++, message:{{type:'output_ack', seq:highest}}}});
+              scheduleInput();
+            }}
+          }} else {{
+            (listeners['msg:custom'] || []).forEach(fn => fn(message));
+          }}
         }} catch (error) {{ console.error('notebook-terminal output bridge', error); }}
       }}
       if (control.value && control.value !== previousControl) {{
@@ -602,6 +619,19 @@ class TerminalWidget(widgets.VBox):
         return self
 
     def _new_window(self, command: str | None = None):
+        if isinstance(self.session, RemoteTerminalSession):
+            return TerminalWidget(
+                session=RemoteTerminalSession(**self.session.clone_kwargs()),
+                height=self.height,
+                font_size=self.font_size,
+                scrollback=self.scrollback,
+                interactive=self.interactive,
+                allow_copy=self.allow_copy,
+                allow_paste=self.allow_paste,
+                rich_tabs=self.rich_tabs,
+                command=command,
+                auto_display=True,
+            )
         return TerminalWidget(
             shell=self.session.shell,
             cwd=self.session.cwd,
@@ -619,10 +649,12 @@ class TerminalWidget(widgets.VBox):
             auto_display=True,
         )
 
-    def run(self, command: str, *, new_window: bool = False):
+    def run(self, command: str, *, cwd: str | None = None, new_window: bool = False):
         if new_window:
-            return self._new_window(command)
-        self.session.run(command)
+            widget = self._new_window()
+            widget.session.run(command, cwd=cwd)
+            return widget
+        self.session.run(command, cwd=cwd)
         return None
 
     def send_text(self, text: str, *, new_window: bool = False):
@@ -633,29 +665,39 @@ class TerminalWidget(widgets.VBox):
         self.session.send(text)
         return None
 
-    def run_python(self, code: str, executable: str | None = None, *, rich_output: bool = False,
-                   new_window: bool = False, clear_previous: bool = False):
+    def run_python(self, code: str, executable: str | None = None, *, interpreter: str | None = None,
+                   cwd: str | None = None, rich_output: bool = False, new_window: bool = False,
+                   clear_previous: bool = False):
         if new_window:
             widget = self._new_window()
-            widget.run_python(code, executable, rich_output=rich_output, clear_previous=clear_previous)
+            widget.run_python(code, executable, interpreter=interpreter, cwd=cwd, rich_output=rich_output,
+                              clear_previous=clear_previous)
             return widget
         if clear_previous:
             self.clear_tabs()
-        self.session.run_python(code, executable, rich_output=rich_output,
+        self.session.run_python(code, executable, interpreter=interpreter, cwd=cwd, rich_output=rich_output,
                                 artifact_callback=self._add_tab if rich_output else None)
         return None
 
-    def run_python_file(self, path: str, executable: str | None = None, *, rich_output: bool = False,
-                        args: list[str] | None = None, new_window: bool = False,
-                        clear_previous: bool = False):
+    def run_python_file(self, path: str, executable: str | None = None, *, interpreter: str | None = None,
+                        cwd: str | None = None, rich_output: bool = False, args=None, kwargs=None,
+                        new_window: bool = False, clear_previous: bool = False):
+        """Run a Python file and pass arguments exactly as separate argv items.
+
+        Examples::
+
+            term.run_python_file("script.py", args=["input.csv", "two words"])
+            term.run_python_file("train.py", kwargs={"epochs": 10, "verbose": True})
+        """
         if new_window:
             widget = self._new_window()
-            widget.run_python_file(path, executable, rich_output=rich_output, args=args,
-                                   clear_previous=clear_previous)
+            widget.run_python_file(path, executable, interpreter=interpreter, cwd=cwd, rich_output=rich_output,
+                                   args=args, kwargs=kwargs, clear_previous=clear_previous)
             return widget
         if clear_previous:
             self.clear_tabs()
-        self.session.run_python_file(path, executable, rich_output=rich_output, args=args,
+        self.session.run_python_file(path, executable, interpreter=interpreter, cwd=cwd, rich_output=rich_output,
+                                     args=args, kwargs=kwargs,
                                      artifact_callback=self._add_tab if rich_output else None)
         return None
 
@@ -793,4 +835,41 @@ class ManagedTerminalWidget(TerminalWidget):
 
 
 def terminal(*args, **kwargs) -> TerminalWidget:
-    return TerminalWidget(*args, **kwargs)
+    """Create a local or JupyterHub-backed terminal widget.
+
+    Local (default)::
+
+        terminal()
+
+    Remote JupyterHub/Jupyter Server::
+
+        terminal(
+            backend="jupyterhub",
+            hub_url="https://hub.example.com",
+            username="alice",
+            token="...",
+        )
+
+    ``server_url`` may be supplied instead of ``hub_url`` and ``username``.
+    """
+    backend = kwargs.pop("backend", "local")
+    if backend in {"local", None}:
+        return TerminalWidget(*args, **kwargs)
+    if backend not in {"jupyterhub", "remote", "jupyter-server"}:
+        raise ValueError(f"Unsupported terminal backend: {backend!r}")
+
+    remote_keys = {
+        "token", "server_url", "hub_url", "username", "server_name",
+        "terminal_name", "create_terminal", "delete_on_close", "verify_ssl",
+        "request_timeout", "websocket_timeout", "extra_headers", "cols",
+        "rows", "capture_limit", "autostart", "allow_token_in_url",
+    }
+    session_kwargs = {key: kwargs.pop(key) for key in tuple(kwargs) if key in remote_keys}
+    session = RemoteTerminalSession(**session_kwargs)
+    return TerminalWidget(*args, session=session, **kwargs)
+
+
+def remote_terminal(*args, **kwargs) -> TerminalWidget:
+    """Convenience alias for ``terminal(backend='jupyterhub', ...)``."""
+    kwargs["backend"] = "jupyterhub"
+    return terminal(*args, **kwargs)

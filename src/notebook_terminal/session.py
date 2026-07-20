@@ -144,13 +144,43 @@ class TerminalSession:
         """Send raw text to the shell input stream."""
         return self.write(text)
 
-    def run(self, command: str, *, record_history: bool = True):
-        """Execute a command in the persistent shell session."""
+    def _resolve_cwd(self, cwd: str | os.PathLike[str] | None) -> str | None:
+        if cwd is None:
+            return None
+        value = os.path.abspath(os.fspath(cwd))
+        if not os.path.isdir(value):
+            raise NotADirectoryError(value)
+        return value
+
+    def _command_in_cwd(self, command: str, cwd: str | os.PathLike[str] | None) -> str:
+        resolved = self._resolve_cwd(cwd)
+        if resolved is None:
+            return command
+        shell_name = os.path.basename(str(self.shell)).lower()
+        if os.name != 'nt':
+            return f"(cd -- {shlex.quote(resolved)} && {command})"
+        if 'powershell' in shell_name or shell_name.startswith('pwsh'):
+            escaped = resolved.replace("'", "''")
+            return (
+                f"& {{ Push-Location -LiteralPath '{escaped}'; "
+                f"try {{ {command} }} finally {{ Pop-Location }} }}"
+            )
+        quoted = subprocess.list2cmdline([resolved])
+        return f"pushd {quoted} && ({command}) & popd"
+
+    def run(self, command: str, *, cwd: str | os.PathLike[str] | None = None,
+            record_history: bool = True):
+        """Execute a command in the persistent shell session.
+
+        ``cwd`` applies only to this command and does not permanently change
+        the directory of the interactive shell.
+        """
         command = str(command)
+        submitted = self._command_in_cwd(command, cwd)
         if record_history and command.strip():
             with self._lock:
                 self._command_history.append(command)
-        return self.write(command + ('\r\n' if os.name == 'nt' else '\n'))
+        return self.write(submitted + ('\r\n' if os.name == 'nt' else '\n'))
 
     @property
     def command_history(self) -> tuple[str, ...]:
@@ -277,8 +307,16 @@ class TerminalSession:
                 time.sleep(.03)
         threading.Thread(target=watch, daemon=True).start()
 
-    def run_python(self, code: str, executable: str | None = None, *, rich_output: bool = False, artifact_callback=None):
-        executable = executable or sys.executable
+    @staticmethod
+    def _resolve_interpreter(executable: str | None, interpreter: str | None, default: str) -> str:
+        if executable is not None and interpreter is not None and str(executable) != str(interpreter):
+            raise ValueError("Provide either executable or interpreter, not both")
+        return str(interpreter or executable or default)
+
+    def run_python(self, code: str, executable: str | None = None, *, interpreter: str | None = None,
+                   cwd: str | os.PathLike[str] | None = None, rich_output: bool = False,
+                   artifact_callback=None):
+        executable = self._resolve_interpreter(executable, interpreter, sys.executable)
         source_path = self._write_temp_python(code)
         if rich_output:
             runner = os.path.join(os.path.dirname(__file__), 'rich_runner.py')
@@ -287,14 +325,53 @@ class TerminalSession:
             cmd = self._quote_command([executable, runner, '--code', source_path, '--artifacts', artifact_path])
         else:
             cmd = self._quote_command([executable, source_path])
-        return self.run(cmd)
+        return self.run(cmd, cwd=cwd)
 
-    def run_python_file(self, path: str, executable: str | None = None, *, rich_output: bool = False, args: list[str] | None = None, artifact_callback=None):
-        executable = executable or sys.executable
-        full_path = os.path.abspath(path)
+    def run_python_file(
+        self,
+        path: str,
+        executable: str | None = None,
+        *,
+        interpreter: str | None = None,
+        rich_output: bool = False,
+        cwd: str | os.PathLike[str] | None = None,
+        args=None,
+        kwargs=None,
+        artifact_callback=None,
+    ):
+        """Run a Python file with positional and named command-line arguments.
+
+        ``args`` may be any iterable of values. Every value is converted to
+        ``str`` and passed as a separate argv element, so spaces and shell
+        metacharacters are quoted safely.
+
+        ``kwargs`` maps option names to values. Keys are converted to command
+        line options (``epochs`` -> ``--epochs``). ``True`` emits a flag,
+        ``False``/``None`` omit it, and list/tuple values repeat the option.
+        Keys beginning with ``-`` are used unchanged.
+        """
+        executable = self._resolve_interpreter(executable, interpreter, sys.executable)
+        base_cwd = self._resolve_cwd(cwd)
+        raw_path = os.fspath(path)
+        full_path = os.path.abspath(os.path.join(base_cwd, raw_path)) if base_cwd and not os.path.isabs(raw_path) else os.path.abspath(raw_path)
         if not os.path.isfile(full_path):
             raise FileNotFoundError(full_path)
-        argv = list(args or [])
+
+        argv = [str(value) for value in (args or [])]
+        for key, value in (kwargs or {}).items():
+            option = str(key)
+            if not option.startswith('-'):
+                option = '--' + option.replace('_', '-')
+            if value is True:
+                argv.append(option)
+            elif value is False or value is None:
+                continue
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    argv.extend((option, str(item)))
+            else:
+                argv.extend((option, str(value)))
+
         if rich_output:
             runner = os.path.join(os.path.dirname(__file__), 'rich_runner.py')
             artifact_path = self._artifact_file()
@@ -302,7 +379,7 @@ class TerminalSession:
             command = [executable, runner, '--file', full_path, '--artifacts', artifact_path, *argv]
         else:
             command = [executable, full_path, *argv]
-        return self.run(self._quote_command(command))
+        return self.run(self._quote_command(command), cwd=base_cwd)
     def send_key(self, key: str):
         """Send a named control key to the process."""
         keys = {

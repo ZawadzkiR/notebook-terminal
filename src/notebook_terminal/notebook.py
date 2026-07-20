@@ -18,6 +18,7 @@ import ipywidgets as widgets
 from IPython.display import Javascript, display
 
 from .session import TerminalSession
+from .remote import RemoteTerminalSession
 from .styling import Color, ansi_text
 
 _STATIC = Path(__file__).with_name("static")
@@ -251,8 +252,15 @@ class TerminalWidget(widgets.VBox):
         self._text = ""
         self._dispatcher = _KernelDispatcher()
         self._output_lock = threading.Lock()
-        self._pending: list[str] = []
-        self._flush_scheduled = False
+        self._pending: list[bytes] = []
+        self._pending_size = 0
+        self._flush_timer = None
+        self._output_packets = deque()
+        self._next_output_seq = 1
+        self._last_output_ack = 0
+        self._last_input_seq = 0
+        self._control_actions = deque(maxlen=32)
+        self._next_control_seq = 1
         self._tab_items: list[tuple[str, widgets.Widget]] = []
         self._namespace: dict[str, Any] = {"__name__": "__main__"}
 
@@ -355,40 +363,81 @@ class TerminalWidget(widgets.VBox):
     root.dataset.nbtermReady = '1';
     {bundle}
     const listeners = {{}};
+    let nextInputSeq = 1;
+    let inputAck = 0;
+    let pendingInput = [];
+    let publishTimer = null;
+    const publishInput = () => {{
+      publishTimer = null;
+      if (!pendingInput.length) return;
+      input.value = JSON.stringify({{events: pendingInput}});
+      input.dispatchEvent(new Event('input', {{bubbles:true}}));
+      input.dispatchEvent(new Event('change', {{bubbles:true}}));
+    }};
+    const scheduleInput = () => {{
+      if (publishTimer === null) publishTimer = setTimeout(publishInput, 8);
+    }};
     const model = {{
       get(name) {{ return settings[name]; }},
       on(name, callback) {{ (listeners[name] ||= []).push(callback); }},
       send(message) {{
-        input.value = JSON.stringify({{seq: Date.now() + Math.random(), ...message}});
-        input.dispatchEvent(new Event('input', {{bubbles:true}}));
-        input.dispatchEvent(new Event('change', {{bubbles:true}}));
+        pendingInput.push({{seq: nextInputSeq++, message}});
+        scheduleInput();
       }}
     }};
     window.__nbterm_render({{model, el: root}});
     let previousOutput = '';
+    let lastOutputSeq = 0;
     let previousControl = '';
+    let lastActionSeq = 0;
     const poll = () => {{
       if (!document.body.contains(root)) return;
       if (output.value && output.value !== previousOutput) {{
         previousOutput = output.value;
         try {{
           const message = JSON.parse(output.value);
-          (listeners['msg:custom'] || []).forEach(fn => fn(message));
+          if (message && message.type === 'output_batch') {{
+            let highest = 0;
+            for (const item of (message.items || [])) {{
+              const seq = Number(item.seq || 0);
+              if (seq <= lastOutputSeq) continue;
+              lastOutputSeq = seq;
+              highest = Math.max(highest, seq);
+              (listeners['msg:custom'] || []).forEach(fn => fn({{type:'output', data:item.data}}));
+            }}
+            if (highest > 0) {{
+              pendingInput.push({{seq: nextInputSeq++, message:{{type:'output_ack', seq:highest}}}});
+              scheduleInput();
+            }}
+          }} else {{
+            (listeners['msg:custom'] || []).forEach(fn => fn(message));
+          }}
         }} catch (error) {{ console.error('notebook-terminal output bridge', error); }}
       }}
       if (control.value && control.value !== previousControl) {{
         previousControl = control.value;
         try {{
-          const message = JSON.parse(control.value);
-          if (message.type === 'interactive') {{
-            settings.interactive = !!message.value;
-            (listeners['change:interactive'] || []).forEach(fn => fn());
-          }} else {{
-            (listeners['msg:custom'] || []).forEach(fn => fn(message));
+          const state = JSON.parse(control.value);
+          const ack = Number(state.input_ack || 0);
+          if (ack > inputAck) {{
+            inputAck = ack;
+            pendingInput = pendingInput.filter(item => item.seq > ack);
+            if (pendingInput.length) scheduleInput();
+          }}
+          for (const action of (state.actions || [])) {{
+            if (action.seq <= lastActionSeq) continue;
+            lastActionSeq = action.seq;
+            const message = action.message || {{}};
+            if (message.type === 'interactive') {{
+              settings.interactive = !!message.value;
+              (listeners['change:interactive'] || []).forEach(fn => fn());
+            }} else {{
+              (listeners['msg:custom'] || []).forEach(fn => fn(message));
+            }}
           }}
         }} catch (error) {{ console.error('notebook-terminal control bridge', error); }}
       }}
-      setTimeout(poll, 20);
+      setTimeout(poll, 12);
     }};
     poll();
   }};
@@ -401,48 +450,89 @@ class TerminalWidget(widgets.VBox):
         if not raw:
             return
         try:
-            message = json.loads(raw)
+            envelope = json.loads(raw)
         except Exception:
             return
-        kind = message.get("type")
-        if kind == "ready":
-            self.session.resize(int(message.get("cols", 80)), int(message.get("rows", 24)))
-        elif kind == "input" and self._interactive:
-            try:
-                self.session.write(base64.b64decode(message.get("data", "")))
-            except Exception:
-                pass
-        elif kind == "resize":
-            self.session.resize(int(message.get("cols", 80)), int(message.get("rows", 24)))
+        events = envelope.get("events") or []
+        for event in sorted(events, key=lambda item: int(item.get("seq", 0))):
+            seq = int(event.get("seq", 0))
+            if seq <= self._last_input_seq:
+                continue
+            message = event.get("message") or {}
+            kind = message.get("type")
+            if kind == "ready":
+                self.session.resize(int(message.get("cols", 80)), int(message.get("rows", 24)))
+            elif kind == "input" and self._interactive:
+                try:
+                    self.session.write(base64.b64decode(message.get("data", "")))
+                except Exception:
+                    pass
+            elif kind == "resize":
+                self.session.resize(int(message.get("cols", 80)), int(message.get("rows", 24)))
+            elif kind == "output_ack":
+                self._ack_output(int(message.get("seq", 0)))
+            self._last_input_seq = seq
+        self._publish_control_state()
 
-    def _send_bridge(self, channel: widgets.Textarea, message: dict[str, Any]) -> None:
-        if channel is self._js_output:
-            self._bridge_output_seq += 1
-            seq = self._bridge_output_seq
-        else:
-            self._bridge_control_seq += 1
-            seq = self._bridge_control_seq
-        channel.value = json.dumps({"seq": seq, **message}, ensure_ascii=False)
+    def _publish_control_state(self) -> None:
+        payload = {
+            "input_ack": self._last_input_seq,
+            "actions": list(self._control_actions),
+        }
+        self._js_control.value = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def _queue_control(self, message: dict[str, Any]) -> None:
+        self._control_actions.append({"seq": self._next_control_seq, "message": message})
+        self._next_control_seq += 1
+        self._publish_control_state()
+
+    def _ack_output(self, seq: int) -> None:
+        if seq <= self._last_output_ack:
+            return
+        self._last_output_ack = seq
+        while self._output_packets and self._output_packets[0][0] <= seq:
+            self._output_packets.popleft()
+        if self._output_packets:
+            self._publish_output_state()
 
     def _on_output(self, data: bytes) -> None:
         if not data:
             return
         with self._output_lock:
-            self._pending.append(data.decode("utf-8", "replace"))
-            if self._flush_scheduled:
+            self._pending.append(bytes(data))
+            self._pending_size += len(data)
+            if self._flush_timer is not None:
                 return
-            self._flush_scheduled = True
-        self._dispatcher.call(self._flush)
+            self._flush_timer = threading.Timer(0.025, lambda: self._dispatcher.call(self._flush))
+            self._flush_timer.daemon = True
+            self._flush_timer.start()
 
     def _flush(self) -> None:
         with self._output_lock:
-            chunk = "".join(self._pending)
-            self._pending.clear()
-            self._flush_scheduled = False
-        if not chunk:
+            chunks = self._pending
+            self._pending = []
+            self._pending_size = 0
+            self._flush_timer = None
+        if not chunks:
             return
-        encoded = base64.b64encode(chunk.encode("utf-8", "replace")).decode("ascii")
-        self._send_bridge(self._js_output, {"type": "output", "data": encoded})
+        data = b"".join(chunks)
+        # Keep individual Comm payloads moderate while preserving exact bytes.
+        for offset in range(0, len(data), 65536):
+            part = data[offset:offset + 65536]
+            seq = self._next_output_seq
+            self._next_output_seq += 1
+            encoded = base64.b64encode(part).decode("ascii")
+            self._output_packets.append((seq, encoded))
+        self._publish_output_state()
+
+    def _publish_output_state(self) -> None:
+        if not self._output_packets:
+            return
+        # The newest state always contains every unacknowledged packet. Trait
+        # update coalescing therefore cannot lose output.
+        items = [{"seq": seq, "data": data} for seq, data in self._output_packets]
+        payload = {"type": "output_batch", "items": items, "upto": items[-1]["seq"]}
+        self._js_output.value = json.dumps(payload, separators=(",", ":"))
 
     def _refresh_tabs(self, selected: int | None = None) -> None:
         buttons = []
@@ -529,6 +619,19 @@ class TerminalWidget(widgets.VBox):
         return self
 
     def _new_window(self, command: str | None = None):
+        if isinstance(self.session, RemoteTerminalSession):
+            return TerminalWidget(
+                session=RemoteTerminalSession(**self.session.clone_kwargs()),
+                height=self.height,
+                font_size=self.font_size,
+                scrollback=self.scrollback,
+                interactive=self.interactive,
+                allow_copy=self.allow_copy,
+                allow_paste=self.allow_paste,
+                rich_tabs=self.rich_tabs,
+                command=command,
+                auto_display=True,
+            )
         return TerminalWidget(
             shell=self.session.shell,
             cwd=self.session.cwd,
@@ -546,10 +649,12 @@ class TerminalWidget(widgets.VBox):
             auto_display=True,
         )
 
-    def run(self, command: str, *, new_window: bool = False):
+    def run(self, command: str, *, cwd: str | None = None, new_window: bool = False):
         if new_window:
-            return self._new_window(command)
-        self.session.run(command)
+            widget = self._new_window()
+            widget.session.run(command, cwd=cwd)
+            return widget
+        self.session.run(command, cwd=cwd)
         return None
 
     def send_text(self, text: str, *, new_window: bool = False):
@@ -560,29 +665,39 @@ class TerminalWidget(widgets.VBox):
         self.session.send(text)
         return None
 
-    def run_python(self, code: str, executable: str | None = None, *, rich_output: bool = False,
-                   new_window: bool = False, clear_previous: bool = False):
+    def run_python(self, code: str, executable: str | None = None, *, interpreter: str | None = None,
+                   cwd: str | None = None, rich_output: bool = False, new_window: bool = False,
+                   clear_previous: bool = False):
         if new_window:
             widget = self._new_window()
-            widget.run_python(code, executable, rich_output=rich_output, clear_previous=clear_previous)
+            widget.run_python(code, executable, interpreter=interpreter, cwd=cwd, rich_output=rich_output,
+                              clear_previous=clear_previous)
             return widget
         if clear_previous:
             self.clear_tabs()
-        self.session.run_python(code, executable, rich_output=rich_output,
+        self.session.run_python(code, executable, interpreter=interpreter, cwd=cwd, rich_output=rich_output,
                                 artifact_callback=self._add_tab if rich_output else None)
         return None
 
-    def run_python_file(self, path: str, executable: str | None = None, *, rich_output: bool = False,
-                        args: list[str] | None = None, new_window: bool = False,
-                        clear_previous: bool = False):
+    def run_python_file(self, path: str, executable: str | None = None, *, interpreter: str | None = None,
+                        cwd: str | None = None, rich_output: bool = False, args=None, kwargs=None,
+                        new_window: bool = False, clear_previous: bool = False):
+        """Run a Python file and pass arguments exactly as separate argv items.
+
+        Examples::
+
+            term.run_python_file("script.py", args=["input.csv", "two words"])
+            term.run_python_file("train.py", kwargs={"epochs": 10, "verbose": True})
+        """
         if new_window:
             widget = self._new_window()
-            widget.run_python_file(path, executable, rich_output=rich_output, args=args,
-                                   clear_previous=clear_previous)
+            widget.run_python_file(path, executable, interpreter=interpreter, cwd=cwd, rich_output=rich_output,
+                                   args=args, kwargs=kwargs, clear_previous=clear_previous)
             return widget
         if clear_previous:
             self.clear_tabs()
-        self.session.run_python_file(path, executable, rich_output=rich_output, args=args,
+        self.session.run_python_file(path, executable, interpreter=interpreter, cwd=cwd, rich_output=rich_output,
+                                     args=args, kwargs=kwargs,
                                      artifact_callback=self._add_tab if rich_output else None)
         return None
 
@@ -679,7 +794,7 @@ class TerminalWidget(widgets.VBox):
 
     def clear(self, *, clear_tabs: bool = False):
         self.session.clear_capture()
-        self._send_bridge(self._js_control, {"type": "clear"})
+        self._queue_control({"type": "clear"})
         if clear_tabs:
             self.clear_tabs()
         return None
@@ -696,11 +811,11 @@ class TerminalWidget(widgets.VBox):
 
     def set_interactive(self, value: bool):
         self._interactive = bool(value)
-        self._send_bridge(self._js_control, {"type": "interactive", "value": self._interactive})
+        self._queue_control({"type": "interactive", "value": self._interactive})
         return None
 
     def focus(self):
-        self._send_bridge(self._js_control, {"type": "focus"})
+        self._queue_control({"type": "focus"})
         return None
 
     def close_terminal(self):
@@ -720,4 +835,41 @@ class ManagedTerminalWidget(TerminalWidget):
 
 
 def terminal(*args, **kwargs) -> TerminalWidget:
-    return TerminalWidget(*args, **kwargs)
+    """Create a local or JupyterHub-backed terminal widget.
+
+    Local (default)::
+
+        terminal()
+
+    Remote JupyterHub/Jupyter Server::
+
+        terminal(
+            backend="jupyterhub",
+            hub_url="https://hub.example.com",
+            username="alice",
+            token="...",
+        )
+
+    ``server_url`` may be supplied instead of ``hub_url`` and ``username``.
+    """
+    backend = kwargs.pop("backend", "local")
+    if backend in {"local", None}:
+        return TerminalWidget(*args, **kwargs)
+    if backend not in {"jupyterhub", "remote", "jupyter-server"}:
+        raise ValueError(f"Unsupported terminal backend: {backend!r}")
+
+    remote_keys = {
+        "token", "server_url", "hub_url", "username", "server_name",
+        "terminal_name", "create_terminal", "delete_on_close", "verify_ssl",
+        "request_timeout", "websocket_timeout", "extra_headers", "cols",
+        "rows", "capture_limit", "autostart", "allow_token_in_url",
+    }
+    session_kwargs = {key: kwargs.pop(key) for key in tuple(kwargs) if key in remote_keys}
+    session = RemoteTerminalSession(**session_kwargs)
+    return TerminalWidget(*args, session=session, **kwargs)
+
+
+def remote_terminal(*args, **kwargs) -> TerminalWidget:
+    """Convenience alias for ``terminal(backend='jupyterhub', ...)``."""
+    kwargs["backend"] = "jupyterhub"
+    return terminal(*args, **kwargs)
